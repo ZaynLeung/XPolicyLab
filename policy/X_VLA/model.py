@@ -277,7 +277,7 @@ def build_xvla_proprio(observation: dict[str, Any]) -> np.ndarray:
     ).astype(np.float32)
 
 
-def encode_obs(observation, default_prompt):
+def encode_obs(observation, default_prompt, *, image_views: list[str] | None = None):
     if "images" in observation and "state" in observation:
         head = ensure_hwc_uint8(observation["images"]["cam_high"])
         prompt = resolve_prompt(observation, default_prompt)
@@ -288,7 +288,22 @@ def encode_obs(observation, default_prompt):
             "output_format": "xpolicylab",
         }
 
-    images = [ensure_hwc_uint8(extract_image(observation, ["cam_high", "cam_head", "head_camera", "top_camera"]))]
+    image_views = image_views or ["cam_head"]
+
+    images: list[np.ndarray] = []
+    for view_name in image_views:
+        try:
+            images.append(ensure_hwc_uint8(extract_image(observation, [str(view_name)])))
+        except Exception:
+            pass
+
+    if not images:
+        images = [
+            ensure_hwc_uint8(
+                extract_image(observation, ["cam_high", "cam_head", "head_camera", "top_camera"])
+            )
+        ]
+
     prompt = resolve_prompt(observation, default_prompt)
     return {
         "images": images,
@@ -337,10 +352,22 @@ class Model(ModelTemplate):
             raise ValueError("X-VLA in XPolicyLab currently supports only action_type='ee'.")
 
         self.default_prompt = self.model_cfg.get("prompt", self.task_name)
+        raw_image_views = self.model_cfg.get("image_views")
+        if isinstance(raw_image_views, str):
+            image_views = [part.strip() for part in raw_image_views.split(",") if part.strip()]
+        elif isinstance(raw_image_views, (list, tuple)):
+            image_views = [str(part).strip() for part in raw_image_views if str(part).strip()]
+        else:
+            image_views = []
+        self.image_views = image_views or ["cam_head"]
+
         env_cfg = self.model_cfg.get("env_cfg") or self.model_cfg.get("env_cfg_type")
         self.robot_action_dim_info = get_robot_action_dim_info(env_cfg) if env_cfg is not None else None
         self._latest_env_idx_list: list[int] = [0]
         self.observation_window: list[dict[str, Any]] | None = None
+
+        self.debug_prompt = bool(self.model_cfg.get("debug_prompt", False))
+        self._last_prompt_by_env_idx: dict[int, str] = {}
 
         self.device = self._get_device(self.model_cfg.get("device", "cuda"))
         self.processor = self._load_processor(self.model_cfg)
@@ -416,7 +443,24 @@ class Model(ModelTemplate):
             obs.get("env_idx", index) if isinstance(obs, dict) else index
             for index, obs in enumerate(obs_list)
         ]
-        self.observation_window = [encode_obs(obs, self.default_prompt) for obs in obs_list]
+        self.observation_window = [
+            encode_obs(obs, self.default_prompt, image_views=self.image_views) for obs in obs_list
+        ]
+
+        if self.debug_prompt:
+            for batch_index, env_idx in enumerate(self._latest_env_idx_list):
+                encoded = self.observation_window[batch_index]
+                prompt = resolve_prompt(encoded, self.default_prompt)
+                prompt = str(prompt)
+                prev = self._last_prompt_by_env_idx.get(int(env_idx))
+                if prev != prompt:
+                    self._last_prompt_by_env_idx[int(env_idx)] = prompt
+                    print(
+                        "[DEBUG_XVLA_PROMPT] env_idx="
+                        + str(int(env_idx))
+                        + " prompt="
+                        + repr(prompt)
+                    )
 
     def infer(self, observation: dict[str, Any], steps: int | None = None):
         pil_images = [Image.fromarray(image) for image in observation["images"]]
@@ -463,3 +507,4 @@ class Model(ModelTemplate):
     def reset(self):
         self.observation_window = None
         self._latest_env_idx_list = [0]
+        self._last_prompt_by_env_idx.clear()

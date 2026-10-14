@@ -21,4 +21,9 @@ domain_id: 0
 steps: 10
 device: cuda
 
+# image_views: [cam_head]
+image_views: [cam_head, cam_left_wrist, cam_right_wrist]
+
+debug_prompt: false
+
 port: 6000
